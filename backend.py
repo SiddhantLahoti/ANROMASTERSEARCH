@@ -3,6 +3,7 @@ from io import BytesIO
 import openpyxl
 from openpyxl.drawing.image import Image
 from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, TwoCellAnchor
+from openpyxl.formula.translate import Translator
 from openpyxl.utils import column_index_from_string, coordinate_to_tuple, get_column_letter
 
 
@@ -34,7 +35,7 @@ def read_styles_from_order_file(file_bytes, start_row, style_col, sheet_name=Non
 
     col_idx = parse_column_index(style_col)
     styles = []
-    
+
     for row in range(start_row, ws.max_row + 1):
         val = ws.cell(row=row, column=col_idx).value
         if val is not None:
@@ -50,15 +51,15 @@ def read_styles_from_order_file(file_bytes, start_row, style_col, sheet_name=Non
 def detect_master_layout(ws, scan_limit=25):
     """
     Scans the master sheet to automatically locate:
-    1. Header row
+    1. Header row (e.g., row 9)
     2. Style column
-    3. Maximum table width (last non-empty column in header)
+    3. Maximum table width across parameter rows (1-8) and header
     4. Image column
     """
     header_row = None
     style_col = None
     image_col = None
-    
+
     style_target_keywords = ["STYLE #", "STYLE NO", "STYLE", "DESIGN #", "DESIGN NO"]
 
     # 1. Locate header row and style column
@@ -77,15 +78,17 @@ def detect_master_layout(ws, scan_limit=25):
     if header_row is None:
         raise ValueError("Could not automatically locate a header row with 'Style #' in the selected tab.")
 
-    # 2. Determine table width and image column from the detected header row
+    # 2. Determine table width across parameter rows & header, and locate image column
     max_col = style_col
-    for c in range(1, ws.max_column + 1):
-        val = ws.cell(row=header_row, column=c).value
-        if val is not None and str(val).strip() != "":
-            max_col = max(max_col, c)
-            norm_val = str(val).strip().upper()
-            if any(img_kw in norm_val for img_kw in ["IMAGE", "PHOTO", "PICTURE", "SKETCH"]):
-                image_col = c
+    for r in range(1, header_row + 1):
+        for c in range(1, ws.max_column + 1):
+            val = ws.cell(row=r, column=c).value
+            if val is not None and str(val).strip() != "":
+                max_col = max(max_col, c)
+                if r == header_row:
+                    norm_val = str(val).strip().upper()
+                    if any(img_kw in norm_val for img_kw in ["IMAGE", "PHOTO", "PICTURE", "SKETCH"]):
+                        image_col = c
 
     # Fallback for image column if not explicitly labeled (Column C is default 3)
     if image_col is None:
@@ -145,9 +148,14 @@ def map_style_blocks(ws_b, header_row, style_col, max_col):
 
 
 def copy_cell_range(ws_src, ws_dest, s_row, e_row, dest_start_row, max_col, serial_no=None):
-    """Copies values, styles, and heights. Overwrites Column A with serial number on the block's top row."""
+    """
+    Copies values/formulas, formatting, and row heights.
+    - Translates relative formula row offsets while keeping absolute locks intact.
+    - Overwrites Column A with serial number on the block's top row only when serial_no is passed.
+    """
     for r in range(s_row, e_row + 1):
         cur_dest_row = dest_start_row + (r - s_row)
+        row_offset = cur_dest_row - r
 
         if ws_src.row_dimensions[r].height is not None:
             ws_dest.row_dimensions[cur_dest_row].height = ws_src.row_dimensions[r].height
@@ -156,12 +164,27 @@ def copy_cell_range(ws_src, ws_dest, s_row, e_row, dest_start_row, max_col, seri
             src_cell = ws_src.cell(row=r, column=c)
             dest_cell = ws_dest.cell(row=cur_dest_row, column=c)
 
-            if c == 1 and r == s_row and serial_no is not None:
-                dest_cell.value = serial_no
-            elif c == 1 and r > s_row:
-                dest_cell.value = ""
+            # Assign serial number only for extracted data blocks (not for rows 1-9)
+            if serial_no is not None and c == 1:
+                if r == s_row:
+                    dest_cell.value = serial_no
+                else:
+                    dest_cell.value = ""
             else:
-                dest_cell.value = src_cell.value
+                val = src_cell.value
+                # Translate formulas to adapt relative row coordinates
+                if isinstance(val, str) and val.startswith("="):
+                    if row_offset != 0:
+                        try:
+                            dest_cell.value = Translator(
+                                val, origin=src_cell.coordinate
+                            ).translate_formula(row_offset=row_offset, col_offset=0)
+                        except Exception:
+                            dest_cell.value = val
+                    else:
+                        dest_cell.value = val
+                else:
+                    dest_cell.value = val
 
             if src_cell.has_style:
                 dest_cell.font = copy(src_cell.font)
@@ -195,7 +218,6 @@ def add_fitted_image_to_block(ws_dest, img_bytes, dest_start_row, block_height, 
     start_row_idx = dest_start_row - 1
     end_row_idx = start_row_idx + span_rows
 
-    # Anchor markers using 0-indexed column coordinates
     marker_from = AnchorMarker(col=image_col - 1, colOff=150000, row=start_row_idx, rowOff=50000)
     marker_to = AnchorMarker(col=image_col, colOff=-150000, row=end_row_idx, rowOff=-50000)
 
@@ -208,8 +230,8 @@ def process_workbook_extraction(order_bytes, master_bytes, master_sheet_name, or
     # 1. Read style list from Order File
     target_styles = read_styles_from_order_file(order_bytes, order_start_row, order_style_col)
 
-    # 2. Load Master File
-    wb_b = openpyxl.load_workbook(BytesIO(master_bytes), data_only=True)
+    # 2. Load Master File with formulas preserved
+    wb_b = openpyxl.load_workbook(BytesIO(master_bytes), data_only=False)
     if master_sheet_name not in wb_b.sheetnames:
         raise ValueError(f"Sheet '{master_sheet_name}' not found in the master file.")
     ws_b = wb_b[master_sheet_name]
@@ -223,9 +245,9 @@ def process_workbook_extraction(order_bytes, master_bytes, master_sheet_name, or
     ws_out = wb_out.active
     ws_out.title = f"Master_{master_sheet_name}"
 
-    # Copy header row
-    copy_cell_range(ws_b, ws_out, header_row, header_row, 1, max_col)
-    copy_merged_cells(ws_b, ws_out, header_row, header_row, 1)
+    # Copy top parameter table (rows 1–8) and main table header (header_row) directly
+    copy_cell_range(ws_b, ws_out, 1, header_row, 1, max_col, serial_no=None)
+    copy_merged_cells(ws_b, ws_out, 1, header_row, 1)
 
     # Copy column widths
     for c in range(1, max_col + 1):
@@ -234,12 +256,13 @@ def process_workbook_extraction(order_bytes, master_bytes, master_sheet_name, or
         if w:
             ws_out.column_dimensions[col_letter].width = w
 
-    dest_current_row = 2
+    # Style rows start directly beneath the main header row (row 10 when header is row 9)
+    dest_current_row = header_row + 1
     serial_number = 1
     found_styles = []
     missing_styles = []
 
-    # 5. Extract blocks
+    # 5. Extract style blocks
     for style in target_styles:
         key = style.upper()
         if key in style_blocks:
@@ -255,7 +278,7 @@ def process_workbook_extraction(order_bytes, master_bytes, master_sheet_name, or
                         block_img_bytes = get_image_bytes(img)
                         break
 
-            # Copy contents & merge ranges
+            # Copy contents & merge ranges with formula row-offset translation
             copy_cell_range(ws_b, ws_out, s_row, e_row, dest_current_row, max_col, serial_no=serial_number)
             copy_merged_cells(ws_b, ws_out, s_row, e_row, dest_current_row)
 
