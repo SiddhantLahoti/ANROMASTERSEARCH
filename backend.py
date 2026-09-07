@@ -1,3 +1,4 @@
+import warnings
 from copy import copy
 from io import BytesIO
 import openpyxl
@@ -5,6 +6,9 @@ from openpyxl.drawing.image import Image
 from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, TwoCellAnchor
 from openpyxl.formula.translate import Translator
 from openpyxl.utils import column_index_from_string, coordinate_to_tuple, get_column_letter
+
+# Suppress harmless openpyxl XML parsing warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 
 
 def get_sheet_names_from_bytes(file_bytes):
@@ -150,12 +154,13 @@ def map_style_blocks(ws_b, header_row, style_col, max_col):
 def copy_cell_range(ws_src, ws_dest, s_row, e_row, dest_start_row, max_col, serial_no=None):
     """
     Copies values/formulas, formatting, and row heights.
-    - Translates relative formula row offsets while keeping absolute locks intact.
-    - Overwrites Column A with serial number on the block's top row only when serial_no is passed.
+    - Translates relative formula row offsets while keeping absolute locks ($) intact.
+    - Overwrites Column A with serial number on the block's top row only when serial_no is provided.
     """
+    row_delta = dest_start_row - s_row
+
     for r in range(s_row, e_row + 1):
         cur_dest_row = dest_start_row + (r - s_row)
-        row_offset = cur_dest_row - r
 
         if ws_src.row_dimensions[r].height is not None:
             ws_dest.row_dimensions[cur_dest_row].height = ws_src.row_dimensions[r].height
@@ -164,7 +169,7 @@ def copy_cell_range(ws_src, ws_dest, s_row, e_row, dest_start_row, max_col, seri
             src_cell = ws_src.cell(row=r, column=c)
             dest_cell = ws_dest.cell(row=cur_dest_row, column=c)
 
-            # Assign serial number only for extracted data blocks (not for rows 1-9)
+            # Assign serial number only for extracted data blocks (not rows 1-9)
             if serial_no is not None and c == 1:
                 if r == s_row:
                     dest_cell.value = serial_no
@@ -172,13 +177,13 @@ def copy_cell_range(ws_src, ws_dest, s_row, e_row, dest_start_row, max_col, seri
                     dest_cell.value = ""
             else:
                 val = src_cell.value
-                # Translate formulas to adapt relative row coordinates
+                # Translate formulas if the row position changed
                 if isinstance(val, str) and val.startswith("="):
-                    if row_offset != 0:
+                    if row_delta != 0:
                         try:
                             dest_cell.value = Translator(
                                 val, origin=src_cell.coordinate
-                            ).translate_formula(row_offset=row_offset, col_offset=0)
+                            ).translate_formula(row_delta=row_delta)
                         except Exception:
                             dest_cell.value = val
                     else:
@@ -230,7 +235,7 @@ def process_workbook_extraction(order_bytes, master_bytes, master_sheet_name, or
     # 1. Read style list from Order File
     target_styles = read_styles_from_order_file(order_bytes, order_start_row, order_style_col)
 
-    # 2. Load Master File with formulas preserved
+    # 2. Load Master File with formulas enabled
     wb_b = openpyxl.load_workbook(BytesIO(master_bytes), data_only=False)
     if master_sheet_name not in wb_b.sheetnames:
         raise ValueError(f"Sheet '{master_sheet_name}' not found in the master file.")
@@ -245,7 +250,7 @@ def process_workbook_extraction(order_bytes, master_bytes, master_sheet_name, or
     ws_out = wb_out.active
     ws_out.title = f"Master_{master_sheet_name}"
 
-    # Copy top parameter table (rows 1–8) and main table header (header_row) directly
+    # Copy top parameter table (rows 1–8) and main table header row directly
     copy_cell_range(ws_b, ws_out, 1, header_row, 1, max_col, serial_no=None)
     copy_merged_cells(ws_b, ws_out, 1, header_row, 1)
 
@@ -256,7 +261,7 @@ def process_workbook_extraction(order_bytes, master_bytes, master_sheet_name, or
         if w:
             ws_out.column_dimensions[col_letter].width = w
 
-    # Style rows start directly beneath the main header row (row 10 when header is row 9)
+    # Style rows start directly beneath the header row (e.g., row 10)
     dest_current_row = header_row + 1
     serial_number = 1
     found_styles = []
